@@ -6,11 +6,16 @@
 #include <sys/socket.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <getopt.h>  
 
 #define BUFFER_SIZE 1024
-#define LOCAL_PORT_TO_CLIENT 8443
-#define REMOTE_HOST "127.0.0.1"
-#define REMOTE_PORT 5001
+// #define LOCAL_PORT_TO_CLIENT 8443
+// #define REMOTE_HOST "127.0.0.1"
+// #define REMOTE_PORT 5001
+
+int LOCAL_PORT_TO_CLIENT = 8443;
+char REMOTE_HOST[256] = "127.0.0.1";
+int REMOTE_PORT = 5001;
 
 void handle_request(SSL *ssl);
 void send_local_file(SSL *ssl, const char *path);
@@ -20,8 +25,34 @@ int file_exists(const char *filename);
 // TODO: Parse command-line arguments (-b/-r/-p) and override defaults.
 // Keep behavior consistent with the project spec.
 void parse_args(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+    // (void)argc;
+    // (void)argv;
+
+    // select backend server using -r and port using -p 
+    int opt;
+    while ((opt = getopt(argc, argv, "b:r:p:")) != -1) {
+        switch (opt) {
+            case 'b':
+                // override LOCAL_PORT_TO_CLIENT (local port to listen on)
+                LOCAL_PORT_TO_CLIENT = atoi(optarg);
+                break;
+            case 'r':
+                // override REMOTE_HOST (backend server host)
+                strncpy(REMOTE_HOST, optarg, 255); 
+                REMOTE_HOST[255] = '\0';
+                break;
+            case 'p':
+                // override REMOTE_PORT (backend server port)
+                REMOTE_PORT = atoi(optarg);
+                break;
+            default:
+                fprintf(stderr, "Usage: %s [-b local_port] [-r remote_host] [-p remote_port]\n", argv[0]);
+                fprintf(stderr, "  -b: Local port to listen on (default: 8443)\n");
+                fprintf(stderr, "  -r: Remote backend host (default: 127.0.0.1)\n");
+                fprintf(stderr, "  -p: Remote backend port (default: 5001)\n");
+                exit(EXIT_FAILURE);
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -32,9 +63,7 @@ int main(int argc, char *argv[]) {
     parse_args(argc, argv);
 
     // TODO: Initialize OpenSSL library
-    OPENSSL_init_ssl(0, NULL);
-    SSL_load_error_strings();
-    OpenSSL_add_ssl_algorithms();
+    OPENSSL_init_ssl(OPENSSL_INIT_SSL_DEFAULT, NULL);
     
     // TODO: Create SSL context and load certificate/private key files
     // Files: "server.crt" and "server.key"
@@ -95,6 +124,7 @@ int main(int argc, char *argv[]) {
 
     printf("Proxy server listening on port %d\n", LOCAL_PORT_TO_CLIENT);
 
+    // keep accepting connections and handle requests
     while (1) {
         client_len = sizeof(client_addr);
         client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
@@ -130,16 +160,14 @@ int main(int argc, char *argv[]) {
         // TODO: Clean up SSL connection
         SSL_shutdown(ssl);  
         SSL_free(ssl);      
- 
         close(client_socket);
     }
 
     close(server_socket);
+    
     // TODO: Clean up SSL context
     SSL_CTX_free(ssl_ctx);
-    EVP_cleanup();         
-    ERR_free_strings();    
-    
+
     return 0;
 }
 
@@ -161,7 +189,11 @@ void handle_request(SSL *ssl) {
     // TODO: Read request from SSL connection
     bytes_read = SSL_read(ssl, buffer, sizeof(buffer) - 1);
 
-    if (bytes_read <= 0) { // error reading file
+    if (bytes_read <= 0) {
+        int err = SSL_get_error(ssl, bytes_read);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_ZERO_RETURN) {
+            fprintf(stderr, "Error reading SSL request\n");
+        }
         return;
     }
 
@@ -206,12 +238,27 @@ void handle_request(SSL *ssl) {
         file_name = path[0] == '/' ? path + 1 : path;
     }
 
-    // check if the file exists locally 
-    if (file_exists(file_name)) {
+    // // check if the file exists locally 
+    // if (file_exists(file_name)) {
+    //     printf("Sending local file %s\n", file_name);
+    //     send_local_file(ssl, file_name);
+    // } else {
+    //     printf("Proxying remote file %s\n", file_name);
+    //     proxy_remote_file(ssl, buffer);
+    // }
+
+    int is_ts = strstr(file_name, ".ts") != NULL;
+
+    if (is_ts) {
+        printf("Proxying TS file %s\n", file_name);
+        proxy_remote_file(ssl, buffer);
+    } 
+    else if (file_exists(file_name)) {
         printf("Sending local file %s\n", file_name);
         send_local_file(ssl, file_name);
-    } else {
-        printf("Proxying remote file %s\n", file_name);
+    } 
+    else {
+        printf("File not found locally, proxying %s\n", file_name);
         proxy_remote_file(ssl, buffer);
     }
 
@@ -233,8 +280,13 @@ void send_local_file(SSL *ssl, const char *path) {
                          "<body><h1>404 Not Found</h1></body></html>";
 
         // TODO: Send response via SSL
-        SSL_write(ssl, response, strlen(response)); 
-
+        ssize_t written = SSL_write(ssl, response, strlen(response));
+        if (written <= 0) {
+            int err = SSL_get_error(ssl, written);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                fprintf(stderr, "Error sending 404 response\n");
+            }
+        }
         return;
     }
 
@@ -270,11 +322,36 @@ void send_local_file(SSL *ssl, const char *path) {
     }
 
     // TODO: Send response header and file content via SSL
-    SSL_write(ssl, response, strlen(response)); 
+    ssize_t written = SSL_write(ssl, response, strlen(response));
+    if (written <= 0) {
+        int err = SSL_get_error(ssl, written);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            fprintf(stderr, "Error sending response header\n");
+            fclose(file);
+            return;
+        }
+    }
 
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
         // TODO: Send file data via SSL
-        SSL_write(ssl, buffer, bytes_read);
+        ssize_t sent = SSL_write(ssl, buffer, bytes_read);
+        if (sent <= 0) {
+            int err = SSL_get_error(ssl, sent);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                fprintf(stderr, "Error sending file data\n");
+                break;
+            }
+            // For WANT_READ/WANT_WRITE, retry once
+            sent = SSL_write(ssl, buffer, bytes_read);
+            if (sent <= 0) {
+                fprintf(stderr, "Error sending file data after retry\n");
+                break;
+            }
+        }
+        // Check for partial write (shouldn't happen in blocking mode, but verify)
+        if (sent < (ssize_t)bytes_read) {
+            fprintf(stderr, "Partial write detected\n");
+        }
     }
 
     fclose(file);
@@ -286,7 +363,7 @@ void proxy_remote_file(SSL *ssl, const char *request) {
     int remote_socket;
     struct sockaddr_in remote_addr;
     char buffer[BUFFER_SIZE];
-    ssize_t bytes_read;
+    ssize_t bytes_read, bytes_sent;
 
     remote_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (remote_socket == -1) {
@@ -295,20 +372,63 @@ void proxy_remote_file(SSL *ssl, const char *request) {
     }
 
     remote_addr.sin_family = AF_INET;
-    inet_pton(AF_INET, REMOTE_HOST, &remote_addr.sin_addr);
+    if (inet_pton(AF_INET, REMOTE_HOST, &remote_addr.sin_addr) <= 0) {
+        perror("Invalid remote host address");
+        close(remote_socket);
+        char *error_response = "HTTP/1.1 502 Bad Gateway\r\n"
+                               "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+                               "<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head>"
+                               "<body><h1>502 Bad Gateway</h1><p>Invalid remote host</p></body></html>";
+        SSL_write(ssl, error_response, strlen(error_response));
+        return;
+    }
     remote_addr.sin_port = htons(REMOTE_PORT);
 
     if (connect(remote_socket, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == -1) {
-        printf("Failed to connect to remote server\n");
+        perror("Failed to connect to remote server");
         close(remote_socket);
+        char *error_response = "HTTP/1.1 502 Bad Gateway\r\n"
+                               "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+                               "<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head>"
+                               "<body><h1>502 Bad Gateway</h1><p>Failed to connect to backend server</p></body></html>";
+        SSL_write(ssl, error_response, strlen(error_response));
         return;
     }
 
-    send(remote_socket, request, strlen(request), 0);
+    // Send the request to backend server
+    ssize_t request_len = strlen(request);
+    ssize_t total_sent = 0;
+    while (total_sent < request_len) {
+        bytes_sent = send(remote_socket, request + total_sent, request_len - total_sent, 0);
+        if (bytes_sent <= 0) {
+            perror("Failed to send request to backend");
+            close(remote_socket);
+            return;
+        }
+        total_sent += bytes_sent;
+    }
 
+    // Forward response from backend to client
     while ((bytes_read = recv(remote_socket, buffer, sizeof(buffer), 0)) > 0) {
         // TODO: Forward response to client via SSL
-        SSL_write(ssl, buffer, bytes_read);
+        ssize_t ssl_sent = SSL_write(ssl, buffer, bytes_read);
+        if (ssl_sent <= 0) {
+            int err = SSL_get_error(ssl, ssl_sent);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                fprintf(stderr, "Error forwarding response to client\n");
+                break;
+            }
+            // Retry for WANT_READ/WANT_WRITE
+            ssl_sent = SSL_write(ssl, buffer, bytes_read);
+            if (ssl_sent <= 0) {
+                fprintf(stderr, "Error forwarding response after retry\n");
+                break;
+            }
+        }
+    }
+
+    if (bytes_read < 0) {
+        perror("Error receiving from backend server");
     }
 
     close(remote_socket);
