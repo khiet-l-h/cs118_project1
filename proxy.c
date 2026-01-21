@@ -32,17 +32,44 @@ int main(int argc, char *argv[]) {
     parse_args(argc, argv);
 
     // TODO: Initialize OpenSSL library
-    
+    OPENSSL_init_ssl(0, NULL);
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
     
     // TODO: Create SSL context and load certificate/private key files
     // Files: "server.crt" and "server.key"
-    SSL_CTX *ssl_ctx = NULL;
+
+    // create SSL context 
+    const SSL_METHOD *method = TLS_server_method(); // modern method supporting TLS 1.2/1.3
+    SSL_CTX *ssl_ctx = SSL_CTX_new(method); 
     
+    // check if SSL context is valid 
     if (ssl_ctx == NULL) {
         fprintf(stderr, "Error: SSL context not initialized\n");
         exit(EXIT_FAILURE);
     }
 
+    // load certificate key
+    if (SSL_CTX_use_certificate_file(ssl_ctx, "server.crt", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        fprintf(stderr, "Error: Failed to load server.crt\n");
+        exit(EXIT_FAILURE);
+    }
+ 
+    // load private key 
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        fprintf(stderr, "Error: Failed to load server.key\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // verify certificate and private keys match
+    if (!SSL_CTX_check_private_key(ssl_ctx)) {
+        fprintf(stderr, "Error: Private key does not match certificate\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // given 
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == -1) {
         perror("socket failed");
@@ -69,6 +96,7 @@ int main(int argc, char *argv[]) {
     printf("Proxy server listening on port %d\n", LOCAL_PORT_TO_CLIENT);
 
     while (1) {
+        client_len = sizeof(client_addr);
         client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
         if (client_socket == -1) {
             perror("accept failed");
@@ -78,21 +106,39 @@ int main(int argc, char *argv[]) {
         printf("Accepted connection from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         
         // TODO: Create SSL structure for this connection and perform SSL handshake
-        SSL *ssl = NULL;
-        
-        
-        if (ssl != NULL) {
-            handle_request(ssl);
+        SSL *ssl = SSL_new(ssl_ctx);
+
+        if (ssl == NULL) {
+            // handle_request(ssl);
+            fprintf(stderr, "Error creating SSL object\n");
+            close(client_socket);
+            continue;
         }
+
+        SSL_set_fd(ssl, client_socket); // bind SSL to client socket fd
+
+        // 3 way handshake 
+        if (SSL_accept(ssl) <= 0) {  
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(client_socket);
+            continue;
+        }
+
+        handle_request(ssl);
         
         // TODO: Clean up SSL connection
-        
-        
+        SSL_shutdown(ssl);  
+        SSL_free(ssl);      
+ 
         close(client_socket);
     }
 
     close(server_socket);
     // TODO: Clean up SSL context
+    SSL_CTX_free(ssl_ctx);
+    EVP_cleanup();         
+    ERR_free_strings();    
     
     return 0;
 }
@@ -113,24 +159,54 @@ void handle_request(SSL *ssl) {
     ssize_t bytes_read;
 
     // TODO: Read request from SSL connection
-    bytes_read = 0;
-    
-    if (bytes_read <= 0) {
+    bytes_read = SSL_read(ssl, buffer, sizeof(buffer) - 1);
+
+    if (bytes_read <= 0) { // error reading file
         return;
     }
 
     buffer[bytes_read] = '\0';
+
     char *request = malloc(strlen(buffer) + 1);
+
+    // make a copy of buffer 
     strcpy(request, buffer);
     
+    // parse HTTP request 
     char *method = strtok(request, " ");
-    char *file_name = strtok(NULL, " ");
-    file_name++;
-    if (strlen(file_name) == 0) {
-        strcat(file_name, "index.html");
-    }
+
+    // char *file_name = strtok(NULL, " ");
+    // file_name++;
+    // if (strlen(file_name) == 0) {
+    //     strcat(file_name, "index.html");
+    // }
+
+    char *path = strtok(NULL, " ");
     char *http_version = strtok(NULL, " ");
 
+    if (!method || !path || !http_version) {
+        fprintf(stderr, "Invalid HTTP request\n");
+        free(request);
+        return;
+    }
+
+    // GET method
+    if (strcmp(method, "GET") != 0) {
+        fprintf(stderr, "Unsupported method: %s\n", method);
+        free(request);
+        return;
+    }
+
+    // If path is "/", serve "index.html"
+    char *file_name;
+    if (strcmp(path, "/") == 0) {
+        file_name = "index.html";
+    } else {
+        // Skip leading slash '/'
+        file_name = path[0] == '/' ? path + 1 : path;
+    }
+
+    // check if the file exists locally 
     if (file_exists(file_name)) {
         printf("Sending local file %s\n", file_name);
         send_local_file(ssl, file_name);
@@ -138,6 +214,8 @@ void handle_request(SSL *ssl) {
         printf("Proxying remote file %s\n", file_name);
         proxy_remote_file(ssl, buffer);
     }
+
+    free(request); 
 }
 
 // TODO: Serve local file with correct Content-Type header
@@ -153,26 +231,50 @@ void send_local_file(SSL *ssl, const char *path) {
                          "Content-Type: text/html; charset=UTF-8\r\n\r\n"
                          "<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
                          "<body><h1>404 Not Found</h1></body></html>";
+
         // TODO: Send response via SSL
-        
+        SSL_write(ssl, response, strlen(response)); 
+
         return;
     }
 
     char *response;
+    // html 
     if (strstr(path, ".html")) {
         response = "HTTP/1.1 200 OK\r\n"
                    "Content-Type: text/html; charset=UTF-8\r\n\r\n";
-    } else {
+    } 
+
+    // plain text 
+    else if (strstr(path, ".txt")) {
         response = "HTTP/1.1 200 OK\r\n"
                    "Content-Type: text/plain; charset=UTF-8\r\n\r\n";
     }
 
+    // jpg 
+    else if (strstr(path, ".jpg")) {
+        response = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: image/jpeg\r\n\r\n";
+    }
+
+    // m3u8 
+    else if (strstr(path, ".m3u8")) {
+        response = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: application/vnd.apple.mpegurl\r\n\r\n";
+    }
+
+    // other 
+    else {
+        response = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: application/octet-stream\r\n\r\n";
+    }
+
     // TODO: Send response header and file content via SSL
-    
+    SSL_write(ssl, response, strlen(response)); 
 
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
         // TODO: Send file data via SSL
-        
+        SSL_write(ssl, buffer, bytes_read);
     }
 
     fclose(file);
@@ -206,7 +308,7 @@ void proxy_remote_file(SSL *ssl, const char *request) {
 
     while ((bytes_read = recv(remote_socket, buffer, sizeof(buffer), 0)) > 0) {
         // TODO: Forward response to client via SSL
-        
+        SSL_write(ssl, buffer, bytes_read);
     }
 
     close(remote_socket);
